@@ -44,13 +44,14 @@ import {
   computeCancellationSplit,
   buildCancellationRecord,
 } from "@/app/lib/cancel-stream";
+import { nextActionFor, transition } from "@/app/lib/state-machine";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function createErrorResponse(code: string, message: string, status: number) {
+function createErrorResponse(code: string, message: string, status: number, legacyCode?: string) {
   const ctx = getCorrelationContext();
   return NextResponse.json(
-    { error: { code, message, request_id: ctx?.request_id } },
+    { error: { code, ...(legacyCode ? { legacy_code: legacyCode } : {}), message, request_id: ctx?.request_id } },
     { status },
   );
 }
@@ -183,6 +184,18 @@ export async function POST(
       }
     }
 
+    const result = transition(stream.status, "cancel");
+    if (!result.ok) {
+      if (stream.status === "draft") {
+        return createErrorResponse(
+          "STREAM_NOT_CANCELLABLE",
+          "Draft streams have no escrowed funds. Start the stream before cancelling.",
+          422,
+        );
+      }
+      return createErrorResponse(result.code, result.error, 409, "INVALID_STREAM_STATE");
+    }
+
     // ── Resolve escrow state ──────────────────────────────────────────────────
     const escrow = resolveEscrowState(id);
     const token  = stream.token ?? "XLM";
@@ -232,8 +245,8 @@ export async function POST(
     const now    = new Date().toISOString();
     const updatedStream = {
       ...stream,
-      status:         "cancelled" as const,
-      nextAction:     undefined,
+      status:         result.nextStatus,
+      nextAction:     nextActionFor(result.nextStatus),
       updatedAt:      now,
       // Advance released_amount to vested_amount — escrow fully drained.
       releasedAmount: escrow.vestedAmount.toString(),

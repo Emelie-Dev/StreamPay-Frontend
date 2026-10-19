@@ -5,12 +5,16 @@ import { getCorrelationContext, logger } from "@/app/lib/logger";
 import { checkStreamOrgPolicy } from "@/app/lib/org-policy";
 import { recordPrivilegedStreamAuditEvent } from "@/app/lib/audit-log";
 import { getStellarSettlementClient } from "@/app/lib/stellar";
+import { nextActionFor, transition } from "@/app/lib/state-machine";
 
 type Context = { params: Promise<{ id: string }> };
 
-function createErrorResponse(code: string, message: string, status: number) {
+function createErrorResponse(code: string, message: string, status: number, legacyCode?: string) {
   const context = getCorrelationContext();
-  return NextResponse.json({ error: { code, message, request_id: context?.request_id } }, { status });
+  return NextResponse.json(
+    { error: { code, ...(legacyCode ? { legacy_code: legacyCode } : {}), message, request_id: context?.request_id } },
+    { status },
+  );
 }
 
 function errorResponse(code: string, message: string, status: number) {
@@ -51,8 +55,13 @@ export async function POST(
         }
       }
 
-      if (stream.status !== "active" && stream.status !== "paused") {
-        return errorResponse("INVALID_STREAM_STATE", "Only active or paused streams can be settled", 409);
+      const result = transition(stream.status, "settle");
+      if (!result.ok) {
+        return errorResponse(result.code, result.error, 409, "INVALID_STREAM_STATE");
+      }
+
+      if (result.nextStatus === stream.status) {
+        return NextResponse.json({ data: stream });
       }
 
       const before = structuredClone(stream);
@@ -60,9 +69,9 @@ export async function POST(
       const now = new Date().toISOString();
       const updatedStream = {
         ...stream,
-        nextAction: "withdraw" as const,
+        nextAction: nextActionFor(result.nextStatus),
         settlementTxHash: txHash,
-        status: "ended" as const,
+        status: result.nextStatus,
         updatedAt: now,
         withdrawal: {
           attempts: 0,

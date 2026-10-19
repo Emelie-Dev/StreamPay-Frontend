@@ -19,6 +19,7 @@ import { db, resetDb } from "@/app/lib/db";
 import { auditLogStore, resetAuditLogStore } from "@/app/lib/audit-log";
 import { resetRateLimitStore } from "@/app/lib/rate-limit-store";
 import { _resetOrgDbForTesting } from "@/app/lib/org-db";
+import { nextActionFor } from "@/app/lib/state-machine";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -169,23 +170,26 @@ describe("state guard", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.data.status).toBe("paused");
-    expect(body.data.nextAction).toBe("stop");
+    expect(body.data.nextAction).toBe(nextActionFor("paused"));
   });
 
-  it("returns 409 INVALID_STREAM_STATE when pausing a draft stream", async () => {
+  it("returns 409 ILLEGAL_TRANSITION when pausing a draft stream", async () => {
     const res = await pausePOST(pauseReq(DRAFT_STREAM), ctx(DRAFT_STREAM));
     expect(res.status).toBe(409);
     const body = await res.json();
-    expect(body.error.code).toBe("INVALID_STREAM_STATE");
-    expect(body.error.message).toContain("draft");
+    expect(body.error.code).toBe("ILLEGAL_TRANSITION");
+    expect(body.error.legacy_code).toBe("INVALID_STREAM_STATE");
+    expect(body.error.message).toBe("Action 'pause' is illegal for a stream in 'draft' state.");
     // pausedAt must NOT be set on a failed pause
     expect(db.streams.get(DRAFT_STREAM)?.pausedAt).toBeUndefined();
   });
 
-  it("returns 409 INVALID_STREAM_STATE when pausing an ended stream", async () => {
+  it("returns 409 ILLEGAL_TRANSITION when pausing an ended stream", async () => {
     const res = await pausePOST(pauseReq(ENDED_STREAM), ctx(ENDED_STREAM));
     expect(res.status).toBe(409);
-    expect((await res.json()).error.code).toBe("INVALID_STREAM_STATE");
+    const body = await res.json();
+    expect(body.error.code).toBe("ILLEGAL_TRANSITION");
+    expect(body.error.legacy_code).toBe("INVALID_STREAM_STATE");
     expect(db.streams.get(ENDED_STREAM)?.pausedAt).toBeUndefined();
   });
 
@@ -201,6 +205,20 @@ describe("state guard", () => {
     const after = db.streams.get(DRAFT_STREAM);
     expect(after).toEqual(before);
   });
+
+  it("pausing an already-paused stream is a side-effect-free no-op", async () => {
+    const initial = db.streams.get(ACTIVE_STREAM)!;
+    const pausedAt = "2026-01-01T00:00:00.000Z";
+    const paused = { ...initial, status: "paused" as const, pausedAt, updatedAt: pausedAt };
+    db.streams.set(ACTIVE_STREAM, paused);
+
+    const res = await pausePOST(pauseReq(ACTIVE_STREAM), ctx(ACTIVE_STREAM));
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toEqual(paused);
+    expect(db.streams.get(ACTIVE_STREAM)).toEqual(paused);
+    expect(auditLogStore.list({ targetId: ACTIVE_STREAM })).toHaveLength(0);
+  });
 });
 
 // ─── Response shape ───────────────────────────────────────────────────────────
@@ -212,7 +230,7 @@ describe("response shape", () => {
 
     expect(data).toHaveProperty("id", ACTIVE_STREAM);
     expect(data).toHaveProperty("status", "paused");
-    expect(data).toHaveProperty("nextAction", "stop");
+    expect(data).toHaveProperty("nextAction", nextActionFor("paused"));
     expect(data).toHaveProperty("pausedAt");
     expect(data).toHaveProperty("updatedAt");
     expect(data).toHaveProperty("createdAt");
@@ -287,18 +305,19 @@ describe("idempotency", () => {
     // (but stream-kemi is draft, so it errors, confirming scope isolation)
     const res = await pausePOST(pauseReq(DRAFT_STREAM, { idempotencyKey: key }), ctx(DRAFT_STREAM));
     expect(res.status).toBe(409); // wrong state, not a conflict
-    expect((await res.json()).error.code).toBe("INVALID_STREAM_STATE");
+    expect((await res.json()).error.code).toBe("ILLEGAL_TRANSITION");
   });
 
-  it("no idempotency key: each call is independent", async () => {
+  it("no idempotency key: pausing a paused stream is a no-op success", async () => {
     // First call: succeeds
     const first = await pausePOST(pauseReq(ACTIVE_STREAM), ctx(ACTIVE_STREAM));
     expect(first.status).toBe(200);
+    const pausedAt = (await first.json()).data.pausedAt;
 
-    // Second call (no key, stream already paused): fails with state error
+    // Second call (no key, stream already paused): succeeds without rewriting.
     const second = await pausePOST(pauseReq(ACTIVE_STREAM), ctx(ACTIVE_STREAM));
-    expect(second.status).toBe(409);
-    expect((await second.json()).error.code).toBe("INVALID_STREAM_STATE");
+    expect(second.status).toBe(200);
+    expect((await second.json()).data.pausedAt).toBe(pausedAt);
   });
 });
 
@@ -417,12 +436,12 @@ describe("integration: pause ↔ resume round-trip", () => {
     expect((await repauseRes.json()).data.pausedAt).toBeDefined();
   });
 
-  it("paused stream cannot be paused again", async () => {
+  it("paused stream can be paused again without side effects", async () => {
     await pausePOST(pauseReq(ACTIVE_STREAM), ctx(ACTIVE_STREAM));
     expect(db.streams.get(ACTIVE_STREAM)?.status).toBe("paused");
 
     const res = await pausePOST(pauseReq(ACTIVE_STREAM), ctx(ACTIVE_STREAM));
-    expect(res.status).toBe(409);
-    expect((await res.json()).error.code).toBe("INVALID_STREAM_STATE");
+    expect(res.status).toBe(200);
+    expect((await res.json()).data.pausedAt).toBe(db.streams.get(ACTIVE_STREAM)?.pausedAt);
   });
 });

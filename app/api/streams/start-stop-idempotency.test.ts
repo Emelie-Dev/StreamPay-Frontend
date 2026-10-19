@@ -94,11 +94,22 @@ describe("POST /api/streams/[id]/stop � idempotency", () => {
     expect((await res.json()).data.status).toBe("ended");
   });
 
-  it("returns 409 stopping an already-ended stream", async () => {
+  it("returns the unchanged stream when stopping an already-ended stream", async () => {
     await stopPOST(stopReq(STREAM), ctx(STREAM));
+    const before = structuredClone(db.streams.get(STREAM));
     const res = await stopPOST(stopReq(STREAM), ctx(STREAM));
-    expect(res.status).toBe(409);
-    expect((await res.json()).error.code).toBe("INVALID_STREAM_STATE");
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toEqual(before);
+    expect(db.streams.get(STREAM)).toEqual(before);
+    expect(auditLogStore.list({ targetId: STREAM }).filter(e => e.action === "stream.stop.override")).toHaveLength(1);
+  });
+
+  it("stops a paused stream and sets the next action from the transition table", async () => {
+    const stream = db.streams.get(STREAM)!;
+    db.streams.set(STREAM, { ...stream, status: "paused", nextAction: "start" });
+    const res = await stopPOST(stopReq(STREAM), ctx(STREAM));
+    expect(res.status).toBe(200);
+    expect((await res.json()).data).toMatchObject({ status: "ended", nextAction: "withdraw" });
   });
 
   it("replayed key returns cached response without re-transitioning", async () => {

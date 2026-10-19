@@ -11,7 +11,7 @@
  * | Field       | Value                                      |
  * |-------------|--------------------------------------------|
  * | `status`    | `"paused"`                                 |
- * | `nextAction`| `"stop"`                                   |
+ * | `nextAction`| `"start"`                                  |
  * | `pausedAt`  | ISO-8601 UTC timestamp of this request.    |
  * | `updatedAt` | ISO-8601 UTC timestamp of this request.    |
  *
@@ -37,7 +37,8 @@
  * | Status | Code                    | Reason                                   |
  * |--------|-------------------------|------------------------------------------|
  * | 404    | `STREAM_NOT_FOUND`      | Stream does not exist.                   |
- * | 409    | `INVALID_STREAM_STATE`  | Stream is not `active`.                  |
+ * | 409    | `ILLEGAL_TRANSITION`     | Pause is not allowed in the current state. |
+ * |        | `legacy_code`            | `INVALID_STREAM_STATE` for compatibility. |
  * | 403    | `NOT_ORG_MEMBER`        | Actor is not in the owning org.          |
  * | 403    | `ROLE_INSUFFICIENT`     | Actor's role cannot pause.               |
  * | 409    | `APPROVAL_REQUIRED`     | Org policy requires multi-sig approval.  |
@@ -57,11 +58,12 @@ import { streamsRateLimit } from "@/src/middleware/rateLimit";
 import { getCorrelationContext, logger } from "@/app/lib/logger";
 import { checkStreamOrgPolicy } from "@/app/lib/org-policy";
 import { recordPrivilegedStreamAuditEvent } from "@/app/lib/audit-log";
+import { nextActionFor, transition } from "@/app/lib/state-machine";
 
-function createErrorResponse(code: string, message: string, status: number) {
+function createErrorResponse(code: string, message: string, status: number, legacyCode?: string) {
   const context = getCorrelationContext();
   return NextResponse.json(
-    { error: { code, message, request_id: context?.request_id } },
+    { error: { code, ...(legacyCode ? { legacy_code: legacyCode } : {}), message, request_id: context?.request_id } },
     { status },
   );
 }
@@ -157,12 +159,18 @@ export async function POST(
     }
 
     // ── State guard ───────────────────────────────────────────────────────
-    if (stream.status !== "active") {
+    const result = transition(stream.status, "pause");
+    if (!result.ok) {
       return createErrorResponse(
-        "INVALID_STREAM_STATE",
-        `Cannot pause a stream in '${stream.status}' status. Stream must be active.`,
+        result.code,
+        result.error,
         409,
+        "INVALID_STREAM_STATE",
       );
+    }
+
+    if (result.nextStatus === stream.status) {
+      return NextResponse.json({ data: stream });
     }
 
     // ── Mutation ──────────────────────────────────────────────────────────
@@ -177,8 +185,8 @@ export async function POST(
        * storage field. Cleared by the /start endpoint on resume.
        */
       pausedAt: now,
-      nextAction: "stop" as const,
-      status: "paused" as const,
+      nextAction: nextActionFor(result.nextStatus),
+      status: result.nextStatus,
       updatedAt: now,
     };
 

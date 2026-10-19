@@ -10,12 +10,16 @@ import {
 import { getCorrelationContext, logger } from "@/app/lib/logger";
 import { checkStreamOrgPolicy } from "@/app/lib/org-policy";
 import { recordPrivilegedStreamAuditEvent } from "@/app/lib/audit-log";
+import { nextActionFor, transition } from "@/app/lib/state-machine";
 
 type Context = { params: Promise<{ id: string }> };
 
-function createErrorResponse(code: string, message: string, status: number) {
+function createErrorResponse(code: string, message: string, status: number, legacyCode?: string) {
   const context = getCorrelationContext();
-  return NextResponse.json({ error: { code, message, request_id: context?.request_id } }, { status });
+  return NextResponse.json(
+    { error: { code, ...(legacyCode ? { legacy_code: legacyCode } : {}), message, request_id: context?.request_id } },
+    { status },
+  );
 }
 
 function getHeader(request: Request, name: string): string | null {
@@ -84,19 +88,25 @@ export async function POST(
       }
     }
 
-    if (stream.status !== "active" && stream.status !== "draft") {
+    const result = transition(stream.status, "stop");
+    if (!result.ok) {
       return createErrorResponse(
+        result.code,
+        result.error,
+        409,
         "INVALID_STREAM_STATE",
-        "Only active or draft streams can be stopped",
-        409
       );
+    }
+
+    if (result.nextStatus === stream.status) {
+      return NextResponse.json({ data: stream });
     }
 
     const before = structuredClone(stream);
     const updatedStream = {
       ...stream,
-      nextAction: "withdraw" as const,
-      status: "ended" as const,
+      nextAction: nextActionFor(result.nextStatus),
+      status: result.nextStatus,
       updatedAt: new Date().toISOString(),
     };
     db.streams.set(id, updatedStream);
