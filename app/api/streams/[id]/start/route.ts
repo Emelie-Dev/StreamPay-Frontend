@@ -9,6 +9,10 @@ import {
 } from "@/app/lib/db";
 import { getCorrelationContext, logger } from "@/app/lib/logger";
 import { checkStreamOrgPolicy } from "@/app/lib/org-policy";
+import { appendStreamHistoryEvent } from "@/app/lib/stream-history-writer";
+import { addToOutbox } from "@/app/lib/webhook-outbox";
+import { toWebhookEvent } from "@/app/lib/webhook-events";
+import { publishStreamChange } from "@/app/lib/stream-publish";
 
 type Context = { params: Promise<{ id: string }> };
 
@@ -77,6 +81,11 @@ export async function POST(
     }
 
     const isResume = stream.status === "paused";
+    const resumedAt = new Date();
+    const pauseStarted = stream.pausedAt ? Date.parse(stream.pausedAt) : NaN;
+    const completedPause = isResume && Number.isFinite(pauseStarted)
+      ? Math.max(0, resumedAt.getTime() - pauseStarted)
+      : 0;
 
     const actorAddress = getHeader(request, "Actor-Wallet-Address");
     // Use "start" for initial activation; "resume" maps to "start" in the org policy
@@ -104,10 +113,53 @@ export async function POST(
       // entered paused state and is meaningless once it is active again.
       // Cleared here to prevent stale timestamps appearing in API responses.
       pausedAt: undefined as string | undefined,
+      pausedDurationMs: (stream.pausedDurationMs ?? 0) + completedPause,
       status: "active" as const,
-      updatedAt: new Date().toISOString(),
+      updatedAt: resumedAt.toISOString(),
     };
     db.streams.set(id, updatedStream);
+
+    appendStreamHistoryEvent({
+      streamId: id,
+      type: isResume ? "resumed" : "started",
+      fromStatus: stream.status,
+      toStatus: "active",
+      at: updatedStream.updatedAt,
+      actorWallet: actorAddress,
+    });
+    publishStreamChange({
+      action: "start",
+      actor: actorAddress ?? undefined,
+      after: updatedStream,
+      before: stream,
+      correlationId: getCorrelationContext()?.correlation_id,
+    });
+
+    if (updatedStream.webhook_url) {
+      const action = isResume ? "resume" : "start";
+      const event = toWebhookEvent(stream, updatedStream, action);
+      if (event) {
+        addToOutbox({
+          id: `evt_${id}_${action}_${updatedStream.updatedAt}`,
+          streamId: id,
+          url: updatedStream.webhook_url,
+          event,
+          data: {
+            stream_id: id,
+            status: updatedStream.status,
+            previous_status: stream.status,
+            action,
+            occurred_at: updatedStream.updatedAt,
+            token: updatedStream.token,
+            amount: String(updatedStream.amount ?? ""),
+            rate: String(updatedStream.rate ?? ""),
+            deposited: String(updatedStream.deposited ?? ""),
+            withdrawn: String(updatedStream.withdrawn ?? ""),
+          },
+          createdAt: updatedStream.updatedAt,
+        });
+      }
+    }
 
     const payload = { data: updatedStream };
     if (token) {
